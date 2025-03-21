@@ -96,7 +96,7 @@ def compute_embeddings(model, dataset, batch_size=512, num_workers=4):
     return all_embeddings, indices_list
 
 
-def typical_clustering_selection(all_embeddings, budget=100, k_nn=20, random_state=42):
+def typical_clustering_selection(all_embeddings, labeled_indices, budget=100, k_nn=20, random_state=42):
     """
     Clusters embeddings with KMeans and selects one typical sample per cluster.
         
@@ -117,29 +117,54 @@ def typical_clustering_selection(all_embeddings, budget=100, k_nn=20, random_sta
     np.ndarray: Cluster labels for all samples.
     """
     
-    # Apply KMeans clustering to divide data into 'budget' clusters
-    kmeans = KMeans(n_clusters=budget, random_state=random_state)
-    cluster_labels = kmeans.fit_predict(all_embeddings)
-    selected_indices = []
+ # 1) Number of clusters = size of labeled set + new budget
+    cluster_count = len(labeled_indices) + budget
     
-    # Iterate over each cluster and find the most typical sample
-    for cluster_id in range(budget):
-        cluster_idxs = np.where(cluster_labels == cluster_id)[0]
-        if len(cluster_idxs) == 0:
-            continue  # Skip empty clusters
+    
+    kmeans = KMeans(n_clusters=cluster_count, random_state=random_state)
+    cluster_labels = kmeans.fit_predict(all_embeddings)
+    
+    # 2) Identify which clusters have no labeled samples in them
+    uncovered_clusters = []
+    cluster_sizes = np.zeros(cluster_count, dtype=int)
+    
+    # Convert labeled_indices to a set for faster membership tests
+    labeled_set = set(labeled_indices)
+    
+    for cid in range(cluster_count):
+        # All the points in cluster cid
+        cluster_idxs = np.where(cluster_labels == cid)[0]
         
+        # Check if any labeled point is in this cluster
+        if not any((idx in labeled_set) for idx in cluster_idxs):
+            # This cluster is "uncovered"
+            uncovered_clusters.append(cid)
+            cluster_sizes[cid] = len(cluster_idxs)
+        else:
+            cluster_sizes[cid] = 0
+    
+    # 3) Sort uncovered clusters by size (descending) and keep largest B
+    #    (If there are fewer than B uncovered clusters, we'll pick them all)
+    uncovered_clusters.sort(key=lambda cid: cluster_sizes[cid], reverse=True)
+    selected_clusters = uncovered_clusters[:budget]
+    
+    selected_indices = []
+    # 4) For each cluster in that top-B list, pick the most typical sample
+    for cluster_id in selected_clusters:
+        cluster_idxs = np.where(cluster_labels == cluster_id)[0]
         cluster_embeds = all_embeddings[cluster_idxs]
         
-        # Compute pairwise distances within the cluster
+        # Pairwise distances within the cluster
         distances = pairwise_distances(cluster_embeds, metric="euclidean")
         typicalities = []
         
         for i in range(distances.shape[0]):
-            sorted_dists = np.sort(distances[i])[1:k_nn+1]  # Skip self-distance
-            avg_dist = np.mean(sorted_dists)  # Compute mean distance to k nearest neighbors
-            typicalities.append(1.0 / (avg_dist + 1e-8))  # Compute typicality score
+            # Sort and take k nearest neighbors excluding the point itself
+            sorted_dists = np.sort(distances[i])[1:k_nn + 1]
+            avg_dist = np.mean(sorted_dists)
+            typicalities.append(1.0 / (avg_dist + 1e-8))
         
-        # Find the most typical sample (max typicality score)
+        # Pick the point with the max typicality 
         best_local_idx = np.argmax(typicalities)
         selected_indices.append(cluster_idxs[best_local_idx])
     
