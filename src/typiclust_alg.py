@@ -7,110 +7,140 @@ from torchvision.models import resnet18
 from sklearn.cluster import KMeans
 import sys
 from sklearn.metrics import pairwise_distances
+
+# Add the current file's directory to the system path
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
+# Define the device for computation (GPU if available, otherwise CPU)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ---------------------------
-# SimCLR Encoder Definition
-# ---------------------------
 class SimCLRResNet18(nn.Module):
     """
-    SimCLR Encoder Definition for Self-Supervised Representation 
-        - ResNet-18-based encoder for self-supervised learning 
-        - Final fully connected layer is removed from ResNet-18 to extract a 512-dimensional feature
-    A self-supervised approach is used to learn a semantic feature space on unlabeled data before clustering.
-
-    Parameters:
-        - 
+    SimCLR Encoder Definition for Self-Supervised Representation Learning.
+    - Uses a ResNet-18-based encoder for self-supervised learning.
+    - The final fully connected layer is removed from ResNet-18 to extract a 512-dimensional feature vector.
+    - A projection head is added to further refine the representation.
+    
+    This self-supervised approach is used to learn a semantic feature space on unlabeled data before clustering.
     """
     def __init__(self, feature_dim=128):
         super(SimCLRResNet18, self).__init__()
+        
+        # Load ResNet-18 backbone without pre-trained weights
         backbone = resnet18(pretrained=False)  # We load our own checkpoint later.
+        
+        # Remove the final fully connected layer to get feature extraction layers
         self.encoder = nn.Sequential(*list(backbone.children())[:-1])
+        
+        # Define the projection head (MLP for feature refinement)
         self.projection_head = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, feature_dim)
+            nn.Linear(512, 512),  # First linear layer reduces dimension
+            nn.ReLU(),  # Non-linearity
+            nn.Linear(512, feature_dim)  # Second linear layer maps to feature_dim
         )
     
     def forward(self, x):
         """
-        Pass images through the encoder (all layer except the final fully connected layer)
+        Forward pass through the encoder to extract features.
+        
+        Parameters:
+        x (Tensor): Input image batch.
+        
+        Returns:
+        Tensor: Extracted features of shape (batch_size, 512).
         """
-        h = self.encoder(x)            # Shape: (batch, 512, 1, 1)
-        h = h.view(h.size(0), -1)        # Flattens to (batch, 512)
+        h = self.encoder(x)  # Extract feature maps (batch_size, 512, 1, 1)
+        h = h.view(h.size(0), -1)  # Flatten to (batch_size, 512)
         return h
 
 
 def compute_embeddings(model, dataset, batch_size=512, num_workers=4):
     """
     Computes embeddings for all samples in the dataset using the given model.
-    Returns a numpy array of embeddings and a list of corresponding indices.
-    Given a trained model (self-supervised encoder) and a dataset
-        - 1) Create a DataLoader to iterate over the CIFAR-10 dataset
-        - 2) Run a forward pass to extract embeddings for each sample
-        - 3) Return the embeddings (as a NumPy array) and the sample indices 
     
-    Once a self-supervised representation has been learned, embed all unlabeled data points into that space
-    ... where distances are semantically meaningful. 
+    Steps:
+    1. Create a DataLoader to iterate over the dataset.
+    2. Pass each batch through the model to extract feature embeddings.
+    3. Store the computed embeddings and corresponding indices.
+    
+    Parameters:
+    model (nn.Module): Trained model for feature extraction.
+    dataset (Dataset): Input dataset.
+    batch_size (int): Number of samples per batch.
+    num_workers (int): Number of worker threads for data loading.
+    
+    Returns:
+    np.ndarray: Array of extracted embeddings.
+    list: List of corresponding indices.
     """
     data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-    model.eval()
+    model.eval()  # Set the model to evaluation mode
     embeddings_list = []
     indices_list = []
-    with torch.no_grad():
+    
+    with torch.no_grad():  # Disable gradient computation for efficiency
         for batch_idx, (images, _) in enumerate(data_loader):
             images = images.to(DEVICE)
             
-            # Forward pass to get features 
+            # Forward pass to extract features
             feats = model(images)
             embeddings_list.append(feats.cpu().numpy())
-
-            # Keeps track of which data indices correspond to these embeddings
+            
+            # Track the dataset indices corresponding to the embeddings
             start_idx = batch_idx * data_loader.batch_size
             end_idx = start_idx + images.size(0)
             indices_list.extend(range(start_idx, end_idx))
+    
+    # Combine all batch embeddings into a single NumPy array
     all_embeddings = np.concatenate(embeddings_list, axis=0)
     return all_embeddings, indices_list
-
-
 
 
 def typical_clustering_selection(all_embeddings, budget=100, k_nn=20, random_state=42):
     """
     Clusters embeddings with KMeans and selects one typical sample per cluster.
-    Typicality is defined as the inverse of the average distance to the k_nn nearest neighbors.
-    Returns the list of selected indices and the cluster labels.
-    Implements the "TypiClust" - Typical clustering logic ahdering to the method of Hacohen et al. (2022)
+        
+    Steps:
+    1. Cluster the embedded data points into `budget` clusters using KMeans to ensure diversity.
+    2. Compute a "typicality" score for each point in a cluster based on the inverse of the average distance
+       to its `k_nn` nearest neighbors.
+    3. Select the most typical point from each cluster (i.e., the point in the densest region).
     
-    1) Cluster the embedded data points into "budget" clusters to ensure diversity.
-        - Each cluster tries to capture some meaningful region in the feature space.
-    
-    2) Within each cluster, compute a "typicality" score for each point based on average distance to k nearest neighbours.
-        - Smaller average distance implies point lies in a denser part of the cluster - more typical
-        - typicality(x) = 1 / (average_distance_to_k_neighbours + )
-
-    3) Pick the most "typical" sample from each cluster, return the indices.
-        - Chosen example is representative of cluster - hence data distribution - addresssing the "cold start" problem for low-budget regimes
-
     Parameters:
-        - 
+    all_embeddings (np.ndarray): Embeddings for all samples.
+    budget (int): Number of clusters to form (i.e., number of samples to select).
+    k_nn (int): Number of nearest neighbors to consider for typicality calculation.
+    random_state (int): Seed for reproducibility.
+    
+    Returns:
+    list: Indices of selected typical samples.
+    np.ndarray: Cluster labels for all samples.
     """
+    
+    # Apply KMeans clustering to divide data into 'budget' clusters
     kmeans = KMeans(n_clusters=budget, random_state=random_state)
     cluster_labels = kmeans.fit_predict(all_embeddings)
     selected_indices = []
+    
+    # Iterate over each cluster and find the most typical sample
     for cluster_id in range(budget):
         cluster_idxs = np.where(cluster_labels == cluster_id)[0]
         if len(cluster_idxs) == 0:
-            continue
+            continue  # Skip empty clusters
+        
         cluster_embeds = all_embeddings[cluster_idxs]
+        
+        # Compute pairwise distances within the cluster
         distances = pairwise_distances(cluster_embeds, metric="euclidean")
         typicalities = []
+        
         for i in range(distances.shape[0]):
-            sorted_dists = np.sort(distances[i])[1:k_nn+1]  # skip self-distance
-            avg_dist = np.mean(sorted_dists)
-            typicalities.append(1.0 / (avg_dist + 1e-8))
+            sorted_dists = np.sort(distances[i])[1:k_nn+1]  # Skip self-distance
+            avg_dist = np.mean(sorted_dists)  # Compute mean distance to k nearest neighbors
+            typicalities.append(1.0 / (avg_dist + 1e-8))  # Compute typicality score
+        
+        # Find the most typical sample (max typicality score)
         best_local_idx = np.argmax(typicalities)
         selected_indices.append(cluster_idxs[best_local_idx])
-    return selected_indices, cluster_labels 
+    
+    return selected_indices, cluster_labels
